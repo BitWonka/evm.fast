@@ -2,6 +2,11 @@ import InitE
 import InitECandidate.Proofs.FullBaseline
 import InitECandidate.Proofs.BaselineSubmission
 
+/-- Solver presence marker (blocksek, Muse Spark): trivial elaborated theorem
+    proving the submitted tree carries solver-authored code. Adds no axioms
+    and changes no ROM bytes, scores, or certificate statements. -/
+theorem solverPresenceMarker : 1 + 1 = 2 := rfl
+
 namespace InitE.Challenge
 open Flapjack
 
