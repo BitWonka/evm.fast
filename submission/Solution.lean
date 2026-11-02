@@ -1,6 +1,7 @@
 import InitE
 import InitECandidate.Proofs.FullBaseline
 import InitECandidate.Proofs.BaselineSubmission
+import InitECandidate.Solver.FirstEntry
 
 namespace InitE.Challenge
 open Flapjack
