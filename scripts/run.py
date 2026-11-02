@@ -24,7 +24,7 @@ GUEST_ROOT = Path("/srv/evm-benchmark")
 CPUINFO = Path("/proc/cpuinfo")
 sys.path.insert(0, str(ROOT / "verifier"))
 import verify  # noqa: E402
-from check_submission import check, score_literal  # noqa: E402
+from check_submission import FROZEN_MANIFEST_NAME, check, score_literal  # noqa: E402
 import time_score  # noqa: E402
 
 CHECK = """import Solution
@@ -55,16 +55,25 @@ def build_verify(work: Path) -> dict:
     result = {"status": "failed", "claim": None, "contract_sha256": None}
     try:
         source = work / "source"
-        verify.freeze_submission(ROOT / "submission", source)
-        policy = check(source, ROOT)
+        frozen_verified = verify.freeze_submission(
+            ROOT / "submission", source, ROOT / "verifier" / FROZEN_MANIFEST_NAME
+        )
+        policy = check(source, ROOT, frozen_verified=frozen_verified)
         result["claim"] = policy["claim"]
+        if not frozen_verified:
+            policy = dict(
+                policy, ok=False,
+                errors=["non-editable submission files differ from verifier/frozen-submission.json", *policy["errors"]],
+            )
         if not policy["ok"]:
             return dict(result, status="policy_rejected", errors=policy["errors"])
         env = verify.tools_env(ROOT)
         verify.linux_preflight(env)
         verify.sandbox_probe(env)
         project = work / "project"
-        result["contract_sha256"] = verify.prepare_project(ROOT, source, project, policy["claim"])
+        result["contract_sha256"] = verify.prepare_project(
+            ROOT, source, project, policy["claim"], link_source=True
+        )
 
         def sandboxed(name: str, command: list[str]) -> tuple[bool, str]:
             log = work / f"{name}.log"

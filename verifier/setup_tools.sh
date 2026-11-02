@@ -6,9 +6,10 @@
 # Policy: the judge must be compiled with the project's exact Lean release, because it replays the
 # export through the kernel it was compiled with and lean4export reads the project's .olean files.
 # We therefore pin the comparator revision whose declared toolchain has the SAME MINOR VERSION as
-# ours and override only the patch digit. A hash-pinned transport patch spools exports to files;
-# comparison, axiom checks, primitives, and full kernel replay remain unchanged. Different
-# minor versions and changes to those checks are refused here on purpose.
+# ours and override only the patch digit. A hash-pinned patch spools exports to files and replays
+# deferred declarations in parallel across stock Lean kernel environments; comparison, axiom
+# checks, primitives, and full kernel replay remain unchanged. Different minor versions and changes
+# to those checks are refused here on purpose.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,7 +19,7 @@ export PATH="${HOME}/.elan/bin:${PATH}"
 # leanprover/comparator @ 2026-08-10 (merge of PR #70): declared toolchain v4.33.0, the last
 # revision before the v4.34.0-rc1 bump. Its own manifest pins the matching lean4export.
 readonly comparator_rev="c0c5a52d2aff92b457c3e5ed4a68c1ebc5795809"
-readonly comparator_spool_sha256="de157a76ea8749d19456b32b48fab4ba60cf2ac1615d907a0e395b75ac7d2d4a"
+readonly comparator_spool_sha256="880369b34e19efbc9dc2f35409dbde82cfdade00a3b3a70edc7ea9e9ab39f715"
 # Zouuup/landrun (Linux only)
 readonly landrun_rev="811cfff51ceaf3d9843708aa6d22e9b84ccac8b4"
 # ammkrn/nanoda_lib (independent Lean kernel)
@@ -55,12 +56,13 @@ if [[ "${ours}" != "${theirs}" ]]; then
 fi
 echo "comparator declares $(cat "${tools}/comparator/lean-toolchain"); building with $(cat "${root}/lean-toolchain")"
 cp "${root}/lean-toolchain" "${tools}/comparator/lean-toolchain"
-# Avoid retaining tens of gigabytes of exporter stdout before parsing. The patch
+# Avoid retaining tens of gigabytes of exporter stdout before parsing, and replay
+# deferred declarations in parallel across stock Lean kernel environments. The patch
 # uses secure temporary handles and the existing stream parser, and preserves
 # comparison, both axiom closures, primitive checks and full kernel replay.
 spool_patch="${root}/verifier/patches/comparator-file-spool.patch"
 [[ "$(sha256sum "${spool_patch}" | cut -d ' ' -f 1)" == "${comparator_spool_sha256}" ]] || {
-  echo "refusing: comparator transport patch hash changed" >&2; exit 1;
+  echo "refusing: comparator patch hash changed" >&2; exit 1;
 }
 git -C "${tools}/comparator" apply --check "${spool_patch}"
 git -C "${tools}/comparator" apply "${spool_patch}"

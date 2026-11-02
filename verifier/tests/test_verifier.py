@@ -1,5 +1,8 @@
+import argparse
+import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -7,8 +10,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from check_submission import check, claim, score_literal
-from verify import (MAX_CPUS, VerifyError, freeze_submission,
+from check_submission import (
+    FROZEN_MANIFEST_NAME, check, claim, frozen_submission_manifest,
+    load_frozen_manifest, score_literal, strip_comments, validate_frozen_tree,
+)
+from verify import (MAX_CPUS, VerifyError, freeze_submission, verify as run_verify,
                     limited_lake_command, linux_command, prepare_project, trusted_axioms,
                     clone_project_cache, REBUILT_NAMESPACES, comparator_spool_directory,
                     validate_spool_directory, linux_filesystem_type)
@@ -58,6 +64,89 @@ class PolicyTests(unittest.TestCase):
         (self.root / "notes.zip").unlink()
         (self.root / "Solution.lean").write_text("prelude\n")
         self.assertFalse(check(self.root)["ok"])
+
+    def test_strip_comments_retains_newlines_and_rejects_unclosed(self):
+        cases = [
+            "import InitE.Challenge -- trailing\n",
+            "/- one\ntwo /- inner -/\nthree -/import InitE.Challenge\n",
+            "-- /- not a block\nimport InitE.Challenge\n",
+            "/- -- not a line -/\nimport InitE.Challenge\n",
+        ]
+        for source in cases:
+            with self.subTest(source=source):
+                stripped = strip_comments(source)
+                self.assertEqual(stripped.count("\n"), source.count("\n"))
+                self.assertIn("import InitE.Challenge", stripped)
+        self.assertEqual(strip_comments("--\n" * 5000), "\n" * 5000)
+        for unclosed in ("/- outer /- inner -/ still open", "-/-- overlaps /-"):
+            with self.subTest(unclosed=unclosed), self.assertRaises(ValueError):
+                strip_comments(unclosed)
+
+    def test_frozen_manifest_skips_unchanged_frozen_files_and_catches_tampering(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        trusted = self.root / "trusted"
+        (trusted / "Guest").mkdir(parents=True)
+        (trusted / "InitE").mkdir()
+        (trusted / "verifier").mkdir()
+        (trusted / "InitE" / "Challenge.lean").write_text("def c := True\n")
+        submission = self.root / "submission"
+        (submission / "InitECandidate" / "Proofs").mkdir(parents=True)
+        (submission / "InitECandidate" / "Solver").mkdir()
+        (submission / "Solution.lean").write_text("import InitECandidate.Solver.Helper\n")
+        (submission / "claim.json").write_text('{"K":2}')
+        (submission / "InitECandidate" / "Proofs" / "Base.lean").write_text("import InitE.Challenge\n")
+        (submission / "InitECandidate" / "Solver" / "Helper.lean").write_text("import InitECandidate.Proofs.Base\n")
+        manifest_path = trusted / "verifier" / FROZEN_MANIFEST_NAME
+        manifest_path.write_text(json.dumps(frozen_submission_manifest(submission)))
+
+        frozen = self.root / "frozen1"
+        self.assertTrue(freeze_submission(submission, frozen, manifest_path))
+        self.assertTrue(check(frozen, trusted, frozen_verified=True)["ok"])
+
+        (submission / "InitECandidate" / "Solver" / "Helper.lean").write_text("import Forbidden.Module\n")
+        frozen_bad_solver = self.root / "frozen2"
+        self.assertTrue(freeze_submission(submission, frozen_bad_solver, manifest_path))
+        self.assertFalse(check(frozen_bad_solver, trusted, frozen_verified=True)["ok"])
+
+        (submission / "InitECandidate" / "Solver" / "Helper.lean").write_text("import InitECandidate.Proofs.Base\n")
+        (submission / "InitECandidate" / "Proofs" / "Base.lean").write_text("import Forbidden.Module\n")
+        frozen_tampered = self.root / "frozen3"
+        self.assertFalse(freeze_submission(submission, frozen_tampered, manifest_path))
+        self.assertFalse(check(frozen_tampered, trusted, frozen_verified=False)["ok"])
+        self.assertFalse(check(submission, trusted)["ok"])
+
+        (submission / "InitECandidate" / "Proofs" / "Base.lean").write_text("import InitE.Challenge\n")
+        (submission / "InitECandidate" / "Proofs" / "Added.lean").write_text("import InitE.Challenge\n")
+        self.assertFalse(freeze_submission(submission, self.root / "frozen4", manifest_path))
+        (submission / "InitECandidate" / "Proofs" / "Added.lean").unlink()
+        (submission / "InitECandidate" / "Proofs" / "Base.lean").unlink()
+        self.assertFalse(freeze_submission(submission, self.root / "frozen5", manifest_path))
+        (submission / "InitECandidate" / "Proofs" / "Base.lean").write_text("import InitE.Challenge\n")
+        (submission / "InitECandidate" / "Proofs" / "Base.lean").rename(
+            submission / "InitECandidate" / "Proofs" / "Renamed.lean")
+        self.assertFalse(freeze_submission(submission, self.root / "frozen6", manifest_path))
+        (submission / "InitECandidate" / "Proofs" / "Renamed.lean").rename(
+            submission / "InitECandidate" / "Proofs" / "Base.lean")
+        self.assertTrue(freeze_submission(submission, self.root / "frozen7", manifest_path))
+
+        missing = trusted / "verifier" / "missing-manifest.json"
+        with self.assertRaises(VerifyError):
+            freeze_submission(submission, self.root / "frozen8", missing)
+
+        (submission / "InitECandidate" / "Proofs" / "Base.lean").write_text("import InitE.Challenge\ndef changed := 1\n")
+        report = run_verify(argparse.Namespace(
+            local=submission, trusted=trusted, work=self.root / "work-tampered",
+            hide=[], structural_only=True, progress=False,
+        ))
+        self.assertEqual(report["status"], "policy_rejected")
+        self.assertIn("non-editable submission files differ from verifier/frozen-submission.json", report["errors"])
+
+        (submission / "InitECandidate" / "Proofs" / "Base.lean").write_text("import InitECandidate.Solver.Helper\n")
+        with self.assertRaisesRegex(ValueError, "frozen module may not import editable module"):
+            validate_frozen_tree(submission, trusted)
+
+        committed = load_frozen_manifest(repo_root / "verifier" / FROZEN_MANIFEST_NAME)
+        self.assertEqual(committed, frozen_submission_manifest(repo_root / "submission"))
 
 
 class FreezeTests(unittest.TestCase):
@@ -145,6 +234,34 @@ class FreezeTests(unittest.TestCase):
             self.assertEqual((project / "Guest" / "guest.pp.pnk").read_text(), "fixed original source")
             self.assertFalse((project / ".lake" / "build" / "lib" / "lean" / "InitE").exists())
 
+    def test_prepare_project_link_source_links_private_frozen_copy_not_checkout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            checkout, source, trusted = root / "checkout", root / "source", root / "trusted"
+            for directory in [trusted / "Guest", trusted / "InitE", trusted / "verifier",
+                              trusted / "tools", checkout / "InitECandidate"]:
+                directory.mkdir(parents=True, exist_ok=True)
+            for name in ["lean-toolchain", "lakefile.toml", "lake-manifest.json", "Guest.lean"]:
+                (trusted / name).write_text("trusted")
+            for name in ("lean-process-limit.c", "limited-lake.py"):
+                (trusted / "tools" / name).write_text("trusted limiter " + name)
+            (trusted / "Guest" / "guest.pp.pnk").write_text("fixed")
+            (trusted / "InitE" / "Challenge.lean").write_text("def challenge := True\n")
+            (trusted / "verifier" / "TrustedAxioms.lean").write_text("audit")
+            (trusted / "verifier" / "trusted-axioms.json").write_text("[]")
+            (trusted / "verifier" / "comparator.json").write_text("{}")
+            (trusted / "verifier" / "Challenge.lean.in").write_text("score := {{SCORE}}")
+            (checkout / "Solution.lean").write_text("import InitE\n")
+            (checkout / "InitECandidate" / "Program.lean").write_text("def p := 1\n")
+            freeze_submission(checkout, source)
+            with patch("verify.clone_project_cache", lambda src, dst: dst.mkdir(parents=True)):
+                prepare_project(trusted, source, root / "project", {"K": "infinity"}, link_source=True)
+            staged = root / "project" / "submission" / "InitECandidate" / "Program.lean"
+            self.assertEqual(staged.stat().st_ino, (source / "InitECandidate" / "Program.lean").stat().st_ino)
+            self.assertNotEqual(staged.stat().st_ino, (checkout / "InitECandidate" / "Program.lean").stat().st_ino)
+            (checkout / "InitECandidate" / "Program.lean").write_text("mutated checkout\n")
+            self.assertEqual(staged.read_text(), "def p := 1\n")
+
 
 class CacheCopyTests(unittest.TestCase):
     def test_skips_only_rebuilt_workspace_artifacts_and_copies_independently(self):
@@ -221,7 +338,8 @@ if __name__ == "__main__":
 class ResourceLimitTests(unittest.TestCase):
     def test_verifier_cpu_affinity_and_extended_limits(self):
         env = {"COMPARATOR_LANDRUN": "/usr/bin/true",
-               "COMPARATOR_LEAN4EXPORT": "/usr/bin/true"}
+               "COMPARATOR_LEAN4EXPORT": "/usr/bin/true",
+               "COMPARATOR_NANODA": "/usr/bin/true"}
         for available in (set(range(32)), {2, 5, 8}):
             with self.subTest(available=available), patch("verify.os.sched_getaffinity", return_value=available):
                 command, _ = linux_command(["lake", "build"], Path("/tmp/project"), env, [])
@@ -262,7 +380,8 @@ class ComparatorSpoolTests(unittest.TestCase):
             work = Path(temporary)
             project = work / "project"
             env = {"COMPARATOR_LANDRUN": "/usr/bin/true",
-                   "COMPARATOR_LEAN4EXPORT": "/usr/bin/true"}
+                   "COMPARATOR_LEAN4EXPORT": "/usr/bin/true",
+                   "COMPARATOR_NANODA": "/usr/bin/true"}
             with patch("verify.linux_filesystem_type", return_value=0xEF53):
                 with self.assertRaisesRegex(RuntimeError, "comparator failure"):
                     with comparator_spool_directory(work, project) as spool:
@@ -300,7 +419,8 @@ class ComparatorSpoolTests(unittest.TestCase):
 
     def test_audit_command_does_not_get_spool_access(self):
         env = {"COMPARATOR_LANDRUN": "/usr/bin/true",
-               "COMPARATOR_LEAN4EXPORT": "/usr/bin/true"}
+               "COMPARATOR_LEAN4EXPORT": "/usr/bin/true",
+               "COMPARATOR_NANODA": "/usr/bin/true"}
         command, _ = linux_command(["lake", "build", "TrustedAxioms"], Path("/frozen/project"), env, [])
         self.assertFalse(any(arg.startswith("TMPDIR=") for arg in command))
         self.assertEqual([arg for arg in command if arg.startswith("ReadWritePaths=")],
@@ -309,6 +429,21 @@ class ComparatorSpoolTests(unittest.TestCase):
     def test_statfs_failure_fails_closed(self):
         with self.assertRaises(OSError):
             linux_filesystem_type(Path("/this-verifier-spool-does-not-exist"))
+
+    def test_setup_tools_pins_current_comparator_patch_sha256(self):
+        verifier_dir = Path(__file__).resolve().parents[1]
+        setup_text = (verifier_dir / "setup_tools.sh").read_text()
+        patch_bytes = (verifier_dir / "patches" / "comparator-file-spool.patch").read_bytes()
+        patch_text = patch_bytes.decode("utf-8")
+        actual_sha = hashlib.sha256(patch_bytes).hexdigest()
+        match = re.search(r'^readonly comparator_spool_sha256="([0-9a-f]{64})"$',
+                          setup_text, re.MULTILINE)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(1), actual_sha)
+        self.assertNotIn("lean-toolchain\n", patch_text)
+        config = json.loads((verifier_dir / "comparator.json").read_text())
+        self.assertFalse(config["enable_nanoda"])
+        self.assertNotIn("kernel_threads", config)
 
 
 class ProofBoundaryTests(unittest.TestCase):

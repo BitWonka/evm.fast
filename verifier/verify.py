@@ -26,7 +26,10 @@ import uuid
 from pathlib import Path
 from typing import BinaryIO
 
-from check_submission import check, score_literal, MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES
+from check_submission import (
+    FROZEN_MANIFEST_NAME, MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES,
+    check, hash_frozen_dir, hash_frozen_file, is_editable, load_frozen_manifest, score_literal,
+)
 
 HERE = Path(__file__).resolve().parent
 TRUSTED = HERE.parent
@@ -61,6 +64,21 @@ def clone_tree(src: Path, dst: Path) -> None:
     else:
         cmd = ['cp', '-a', '--reflink=auto', str(src), str(dst)]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
+def link_or_clone_tree(src: Path, dst: Path) -> None:
+    try:
+        shutil.copytree(src, dst, copy_function=os.link)
+    except OSError:
+        shutil.rmtree(dst, ignore_errors=True)
+        clone_tree(src, dst)
+
+
+def link_or_copy_file(src: Path, dst: Path) -> None:
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
 
 
 def linux_preflight(env: dict[str, str]) -> None:
@@ -251,24 +269,40 @@ def sandbox_probe(env: dict[str, str]) -> None:
             raise VerifyError(f"mandatory Linux isolation preflight failed: {detail}")
 
 
-def freeze_submission(source: Path, target: Path) -> None:
+def freeze_submission(source: Path, target: Path,
+                      manifest_path: Path | None = None) -> bool:
     """Bounded fd-relative copy: no links, devices, FIFOs or followed directory races."""
+    expected = None
+    if manifest_path is not None:
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise VerifyError(f"missing frozen submission manifest: {manifest_path}")
+        try:
+            expected = load_frozen_manifest(manifest_path)
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise VerifyError(f"invalid frozen submission manifest: {exc}") from exc
     target.mkdir()
-    entries = total = 0
+    entries = total = frozen_entries = frozen_files = frozen_bytes = 0
+    frozen_digest = hashlib.sha256()
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    def visit(fd: int, destination: Path):
-        nonlocal entries, total
+    def visit(fd: int, destination: Path, prefix: tuple[str, ...]):
+        nonlocal entries, total, frozen_entries, frozen_files, frozen_bytes
         for name in sorted(os.listdir(fd)):
             entries += 1
             if entries > MAX_FILES:
                 raise VerifyError(f"submission has more than {MAX_FILES} entries")
+            rel = Path(*prefix, name)
+            editable = is_editable(rel)
+            if expected is not None and not editable:
+                frozen_entries += 1
             info = os.stat(name, dir_fd=fd, follow_symlinks=False)
             path = destination / name
             if stat.S_ISDIR(info.st_mode):
+                if expected is not None and not editable:
+                    hash_frozen_dir(frozen_digest, rel.as_posix())
                 child = os.open(name, directory_flags, dir_fd=fd)
                 try:
                     path.mkdir()
-                    visit(child, path)
+                    visit(child, path, (*prefix, name))
                 finally:
                     os.close(child)
             elif stat.S_ISREG(info.st_mode):
@@ -285,14 +319,24 @@ def freeze_submission(source: Path, target: Path) -> None:
                 total += len(data)
                 if total > MAX_TOTAL_BYTES:
                     raise VerifyError(f"submission exceeds {MAX_TOTAL_BYTES} bytes")
+                if expected is not None and not editable:
+                    frozen_files += 1
+                    frozen_bytes += len(data)
+                    hash_frozen_file(frozen_digest, rel.as_posix(), len(data), hashlib.sha256(data).digest())
                 path.write_bytes(data)
             else:
                 raise VerifyError(f"{name}: symlinks and special files are forbidden")
     root = os.open(source, directory_flags)
     try:
-        visit(root, target)
+        visit(root, target, ())
     finally:
         os.close(root)
+    return expected is not None and {
+        "entries": frozen_entries,
+        "files": frozen_files,
+        "bytes": frozen_bytes,
+        "sha256": frozen_digest.hexdigest(),
+    } == expected
 
 
 REBUILT_NAMESPACES = (
@@ -340,7 +384,8 @@ def clear_artifacts(project: Path, names: tuple[str, ...]) -> None:
                 stale.unlink()
 
 
-def prepare_project(trusted: Path, source: Path, project: Path, values: dict) -> str:
+def prepare_project(trusted: Path, source: Path, project: Path, values: dict, *,
+                    link_source: bool = False) -> str:
     """Freeze only the challenge contract, then copy the untrusted submission."""
     helpers = ("lean-process-limit.c", "limited-lake.py")
     for name in helpers:
@@ -377,9 +422,14 @@ def prepare_project(trusted: Path, source: Path, project: Path, values: dict) ->
             digest.update(path.relative_to(project).as_posix().encode() + b"\0")
             digest.update(path.read_bytes() + b"\0")
     (project / "submission").mkdir()
-    shutil.copy2(source / "Solution.lean", project / "submission" / "Solution.lean")
-    if (source / "InitECandidate").is_dir():
-        shutil.copytree(source / "InitECandidate", project / "submission" / "InitECandidate")
+    if link_source:
+        link_or_copy_file(source / "Solution.lean", project / "submission" / "Solution.lean")
+        if (source / "InitECandidate").is_dir():
+            link_or_clone_tree(source / "InitECandidate", project / "submission" / "InitECandidate")
+    else:
+        shutil.copy2(source / "Solution.lean", project / "submission" / "Solution.lean")
+        if (source / "InitECandidate").is_dir():
+            clone_tree(source / "InitECandidate", project / "submission" / "InitECandidate")
     clone_project_cache(trusted / ".lake", project / ".lake")
     # Defense in depth: renamed imports must rebuild, independently of cache copying.
     clear_artifacts(project, REBUILT_NAMESPACES)
@@ -434,10 +484,17 @@ def verify(args: argparse.Namespace) -> dict:
     try:
         source = work / "source"
         progress("freezing submission")
-        freeze_submission(args.local, source)
+        frozen_verified = freeze_submission(
+            args.local, source, args.trusted / "verifier" / FROZEN_MANIFEST_NAME
+        )
         progress("checking submission policy")
-        policy = check(source, args.trusted)
+        policy = check(source, args.trusted, frozen_verified=frozen_verified)
         result["claim"] = policy["claim"]
+        if not frozen_verified:
+            policy = dict(
+                policy, ok=False,
+                errors=["non-editable submission files differ from verifier/frozen-submission.json", *policy["errors"]],
+            )
         if not policy["ok"]:
             log.write_text("\n".join(policy["errors"]) + "\n")
             return dict(result, status="policy_rejected", errors=policy["errors"])
@@ -453,7 +510,9 @@ def verify(args: argparse.Namespace) -> dict:
         sandbox_probe(env)
         project = work / "project"
         progress("staging project and trusted cache")
-        result["contract_sha256"] = prepare_project(args.trusted, source, project, policy["claim"])
+        result["contract_sha256"] = prepare_project(
+            args.trusted, source, project, policy["claim"], link_source=True
+        )
         # Trusted audit runs first and imports only the independently frozen challenge.
         audit_log = work / "trusted-audit.log"
         audit_command = limited_lake_command(project, ["lake", "build", "TrustedAxioms"])

@@ -1677,3 +1677,69 @@ composition theorem on function 79 left complete-closure replay essentially
 unchanged, 28.491 versus 28.521 seconds. Each used three replay trials. These
 results favour measured computational shortcuts and compact checking over
 unselective proof factoring or caching.
+
+### Parallel kernel replay in pinned comparator (2026-11-01)
+
+`verifier/patches/comparator-file-spool.patch` (SHA256
+`880369b34e19efbc9dc2f35409dbde82cfdade00a3b3a70edc7ea9e9ab39f715`) replaces
+single-threaded `Environment.replay'` in the pinned `comparator`
+(`c0c5a52d2aff92b457c3e5ed4a68c1ebc5795809`, compiled with Lean `v4.33.1`) with
+`Comparator.ParallelReplay.checkParallel` (default `6` threads; direct
+`comparator` invocations also support `COMPARATOR_KERNEL_THREADS` or optional
+`kernel_threads` in comparator JSON, whereas `verify.py` runs under `env -i`
+with a fixed environment allowlist and an unmodified `verifier/comparator.json`
+so official verifier runs always use the default `6` threads).
+`compareAt`, `checkAxioms` (theorem and definition closures), `primitiveTargets`,
+permitted axioms (`propext`, `Quot.sound`, `Classical.choice`), and disk-backed
+export spooling remain unchanged.
+
+In `checkParallel`, a single-threaded topological pass (`prepareAll`) rejects
+unsafe/partial declarations, checks axioms and inductive/quotient declarations
+sequentially through the stock kernel, inserts safe definitions, theorems, and
+opaques via `addDeclWithoutChecking` while snapshotting each item's exact
+pre-insertion `Kernel.Environment`, and compares postponed inductive,
+constructor, recursor, and quotient constants with `==`. Dedicated worker tasks
+then independently check every deferred declaration via stock
+`Kernel.Environment.addDeclCore 0 0` against its pre-insertion environment
+snapshot, require `actual == expected` on the added constant, and share an
+`IO.CancelToken` for early cancellation on error.
+
+Measured on a 32-vCPU, 128-GiB host (`CPUAffinity=0-29`, `MemoryMax=112 GiB`,
+`MemorySwapMax=0`, `TasksMax=16384`) against prebuilt real exports so timings
+isolate export spooling, stream parsing, declaration/primitive/axiom checks,
+and full Lean kernel replay:
+
+1. **`K=2` submission export** (`29 MiB` challenge export, `210 MiB` solution
+   export):
+
+   | Variant | Comparator wall | Peak cgroup memory | Outcome |
+   | --- | ---: | ---: | --- |
+   | Stock sequential | 194.825 s | — | Accepted |
+   | Parallel `N=1` | 193.572 s | — | Accepted |
+   | Parallel `N=4` | 76.059 s | — | Accepted |
+   | Parallel `N=6` (default) | 59.833 s | — | Accepted |
+   | Parallel `N=8` | 58.944 s | — | Accepted |
+   | Parallel `N=12` | 60.306 s (268.194 CPU s) | 33.366 GiB | Accepted |
+
+2. **Initial `K=infinity` submission export** (`29 MiB` challenge export,
+   `6,104,551,435`-byte / `5.69 GiB` solution export). Because spooling and
+   parsing the `5.69 GiB` export populates reclaimable page cache up to the
+   `112 GiB` cgroup limit (`memory.peak = 112.0 GiB` with `oom_kill = 0`),
+   1 Hz cgroup `memory.stat` sampling also records peak `anon` and
+   `anon + kernel` memory:
+
+   | Variant | Comparator wall | CPU seconds | Peak `anon + kernel` | Outcome |
+   | --- | ---: | ---: | ---: | --- |
+   | Stock sequential (2026-10-30 pilot on identical `015dc95d…` export) | ~17,242 s (4h 47m 22s) | — | — | Accepted |
+   | Parallel `N=4` | 3,086.666 s (51m 27s) | 11,373.047 | 103.793 GiB | Accepted |
+   | Parallel `N=6` (default) | 2,299.706 s (38m 20s) | 12,088.991 | 96.308 GiB | Accepted |
+   | Parallel `N=8` | 1,921.128 s (32m 01s) | 12,888.340 | 107.337 GiB | Accepted |
+   | Parallel `N=12` | 769.088 s (killed) | 6,347.323 | 111.438 GiB | SIGKILL (112 GiB cgroup OOM) |
+
+`N=6` is selected as the default: it cuts `K=2` comparator wall time by **3.26×**
+(`194.8 s` → `59.8 s`) and initial `K=infinity` comparator wall time by **~7.5×**
+(`~17,242 s` → `2,299.7 s`, saving ~4h 09m), while retaining ~15.7 GiB of
+anonymous+kernel headroom under the `112 GiB` zero-swap cap where `N=12` OOMs
+and `N=8` leaves ~4.7 GiB. All 14 upstream comparator fixtures, 9 adversarial
+integration fixtures (`adv_*`), and the direct `ConstantInfo` soundness suite
+(`tests/soundness_replay.lean`) pass.
