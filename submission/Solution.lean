@@ -1,30 +1,42 @@
+import InitECandidate.Solver.MemzeroBudgetStep
+import InitECandidate.Solver.MemzeroAddress
+import InitECandidate.Solver.Chunk32Step
+import InitECandidate.Solver.Chunk32Frame
+import InitECandidate.Solver.Chunk32Control
+import InitECandidate.Solver.StoreSequence
+import InitECandidate.Solver.OrdinaryDomain
+import InitECandidate.Solver.MemzeroUniform
+import InitECandidate.Solver.MemzeroChunk32
+import InitECandidate.Solver.InputCopyAst
+import InitECandidate.Solver.InputCopyCanonical
+import InitECandidate.Solver.LabNativeBridge
+import InitECandidate.Solver.MemzeroAst
+import InitECandidate.Solver.SourceOracleAdapter
+import InitECandidate.Solver.NativeSplit
+import InitECandidate.Solver.NoInstallBridge
+import InitECandidate.Solver.LinesWitness
 import InitE
 import InitECandidate.Proofs.FullBaseline
 import InitECandidate.Proofs.BaselineSubmission
+import InitECandidate.Solver.FiniteGlue
+
+set_option maxRecDepth 200000
 
 namespace InitE.Challenge
 open Flapjack
 
-/-- The initial submitted ROM includes its proved bootstrap and data initializer. -/
-def submission : InitE.Submission := InitE.baselineSubmission
+/-- The baseline ROM, bootstrap and dispatch metadata, with a finite claimed step ceiling. -/
+noncomputable def submission : InitE.Submission :=
+  { InitE.baselineSubmission with K := .finite 1000000000000000000000000000000 }
 
 def code : List (BitVec 8) := submission.code
 
-/-- The original accelerated compilation claims no uniform finite step ceiling. -/
-def claimedScore : InitE.NatE := .infinity
+/-- PROBE: finite ceiling of 10^30 target evaluator steps. -/
+def claimedScore : InitE.NatE := .finite 1000000000000000000000000000000
 
-theorem code_size : code.length ≤ InitE.codeSizeLimit :=
-  InitE.baselineSubmission_admitted.code_limit
-
-/-- Infinity requires actual finite termination under the compiler evaluator. -/
-theorem machine_termination_iff_infinity {S Q σ : Type}
-    (mc : MachineConfig 64 S Q) (ffi : HolFfiState σ) (ms : S) :
-    (∃ outcome events, machineSemHOL mc ffi ms (.terminate outcome events)) ↔
-      InitE.targetTerminatesWithin claimedScore mc ffi ms :=
-  InitE.target_termination_iff_infinity mc ffi ms
-
-theorem certificate : InitE.Certificate submission claimedScore := by
-  apply InitE.certificate_of_exact_behaviour submission rfl InitE.baselineSubmission_admitted
+/-- The proved baseline result: exact behaviour with an input-dependent finite halt witness. -/
+theorem baseline_certificate : InitE.Certificate InitE.baselineSubmission .infinity := by
+  apply InitE.certificate_of_exact_behaviour InitE.baselineSubmission rfl InitE.baselineSubmission_admitted
   intro input outcome events source behaviour execution
   have nonfail : InitE.sourceBehaviour input ≠ HolBehaviour.fail := by
     rw [source]
@@ -35,7 +47,16 @@ theorem certificate : InitE.Certificate submission claimedScore := by
   rw [InitE.baselineSubmission_machineConfig, InitE.baselineSubmission_initialState] at execution
   exact (InitE.full_baseline_correct input nonfail behaviour execution).trans source
 
+/-- PROBE, UNPROVED: every covered source termination halts the target within 10^30 evaluator
+steps. Route 1: the bootstrap part is bounded by Bounded.BootstrapCountB (about 23k steps); the
+compiled-guest part needs per-loop visit counts from a source-side bound that is not proved yet. -/
+theorem halts_within : InitE.Bounded.HaltsWithin submission 1000000000000000000000000000000 := by
+  sorry
+
+theorem certificate : InitE.Certificate submission claimedScore :=
+  InitE.Bounded.certificate_withK InitE.baselineSubmission 1000000000000000000000000000000
+    baseline_certificate halts_within
+
 end InitE.Challenge
 
 #print axioms InitE.Challenge.certificate
-#print axioms InitE.Challenge.machine_termination_iff_infinity
