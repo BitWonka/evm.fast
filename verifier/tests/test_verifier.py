@@ -40,6 +40,12 @@ class PolicyTests(unittest.TestCase):
                 (self.root / "claim.json").write_text(value)
                 self.assertFalse(check(self.root)["ok"])
 
+    def test_large_finite_claim(self):
+        (self.root / "claim.json").write_text('{"K":%d}\n' % (10**295 - 1))
+        self.assertTrue(check(self.root)["ok"])
+        (self.root / "claim.json").write_text('{"K":%d}\n' % 10**295)
+        self.assertFalse(check(self.root)["ok"])
+
     def test_cross_prefix_import_rejected(self):
         (self.root / "InitECandidate" / "Program.lean").write_text("import InitECandidateX.Program\n")
         self.assertFalse(check(self.root)["ok"])
